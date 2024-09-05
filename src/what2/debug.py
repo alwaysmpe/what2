@@ -45,5 +45,6 @@ def dbg(arg: Any) -> None:
     arg_name = string[string.find("(") + 1:-1]
     if in_notebook:
         display(HTML(f"<h5>{arg_name}</h5>"))
+        display(arg)
     else:
-        print(f"{arg_name}:", arg) # noqa: T201
+        print(f"{arg_name}:", arg, sep='\n', end='\n\n') # noqa: T201

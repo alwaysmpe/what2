@@ -1,14 +1,14 @@
 [tool.poetry]
 name = "what2"
-version = "0.1.0"
+version = "0.3.3"
 description = ""
-authors = ["Marc"]
+authors = ["Marc Edwards <marc@mlwhat.com>"]
 readme = "README.md"
 packages = [{include = "what2", from = "src"}]
 
 [tool.poetry.dependencies]
 python = "^3.12"
-
+invoke = "^2.2.0"
 
 [build-system]
 requires = ["poetry-core"]

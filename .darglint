@@ -1,0 +1,4 @@
+[darglint2]
+
+docstring_style=sphinx
+ignore_regex=^_(.*)

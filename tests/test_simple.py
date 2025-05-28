@@ -1,4 +1,5 @@
 from functools import partial
+import sys
 
 from what2_time import Timer
 
@@ -12,10 +13,13 @@ def test_ctx(capsys: pytest.CaptureFixture[str]):
     a = ["hello", "world"]
 
     def get_stdout() -> str:
-        return capsys.readouterr().out
+        out_err = capsys.readouterr()
+        print(out_err.err, file=sys.stderr, end="")
+        print(out_err.out, file=sys.stderr, end="")
+        return out_err.out
 
     def name_in_out(name: str, val: object, stdout: str) -> bool:
-        return f"{name}:\n{val}" in stdout
+        return f"{name}: {val}" in stdout
 
     has_a = partial(name_in_out, "a", a)
     dbg(a)
@@ -42,9 +46,17 @@ def test_ctx(capsys: pytest.CaptureFixture[str]):
     stdout = get_stdout()
     print(stdout)
     assert has_a(stdout)
-    assert '"foo":\nfoo' in stdout
+    assert '"foo": foo' in stdout
     dbg(a,
         "bar")
     stdout = get_stdout()
     assert has_a(stdout)
-    assert '"bar":\nbar' in stdout
+    assert '"bar": bar' in stdout
+
+
+def test_slice(capsys: pytest.CaptureFixture[str]):
+    vals = ["abc", "def"]
+    dbg(vals[0])
+    output = capsys.readouterr().out
+    print(output)
+    assert "vals[0]: abc" in output

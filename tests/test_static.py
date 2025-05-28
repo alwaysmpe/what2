@@ -14,7 +14,12 @@ def is_linux() -> bool:
 
 def call(cmd: list[str]) -> None:
     result = subprocess.run(cmd, cwd=base_dir, check=False)
-    redirect = " 2>&1" if is_linux() else ""
+    if is_linux():
+        redirect = " 2>&1 | head -n 30"
+        cmd = ["unbuffer", *cmd]
+    else:
+        redirect = ""
+
     expanded_command = shlex.join(cmd) + redirect
     print("command run:", expanded_command)
     if result.returncode == 0:

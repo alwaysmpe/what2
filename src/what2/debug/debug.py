@@ -4,19 +4,21 @@ Implementation of `dbg` function.
 
 from __future__ import annotations
 
+import ast
 import builtins
 from collections.abc import Callable
-from contextlib import AbstractContextManager, ExitStack
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from functools import cache, wraps
+import enum
+from functools import wraps
 import inspect
-from typing import Literal, NotRequired, Self, TypedDict, Unpack, final, overload, override
-from unittest.mock import patch
+from inspect import cleandoc
+from pathlib import Path
+from typing import Literal, NamedTuple, NotRequired, Self, TypedDict, Unpack, final, overload, override
 import warnings
 
-import regex
-
 from what2.debug.notebook import is_notebook
+from what2.util import LruDict, cache
 
 try:
     from IPython.core.display import HTML as Html  # type: ignore[reportMissingModuleSource]
@@ -28,50 +30,167 @@ except ImportError:
     display = None
     Html = None
     in_notebook = False
-from types import TracebackType
+from types import FrameType, TracebackType
 
-type DebugImplT = _DebugImpl
+type DebugImplT = Debug
+
+
+class WarnKind(enum.StrEnum):
+    """
+    Enum indicating what warnings have been issued.
+    """
+
+    no_frame = (
+        "Unable to inspect current stack frame, "
+        "possibly running in optimized mode which "
+        "is unsupported."
+    )
+
+    no_src = (
+        "Unable to access call source code, "
+        "possibly running in optimized mode which "
+        "is unsupported."
+    )
+
+    parse_error = (
+        "Error parsing call source, please raise "
+        "an issue on github https://github.com/alwaysmpe/what2/issues"
+    )
+
+
+class ArgDescription(NamedTuple):
+    """
+    Description of a source argument to `dbg`.
+    """
+
+    is_const: bool
+    arg_src: str
 
 
 @final
 @dataclass
-class _DebugImpl(AbstractContextManager[DebugImplT]):
+class Debug(AbstractContextManager[DebugImplT]):
+    """
+    Implementation of `dbg` functionality.
+
+    Tracks state, parses and caches source, splits
+    polymorphic functionality into separate functions.
+    """
+
     with_type: bool = False
     with_id: bool = False
     enabled: bool = True
 
+    _ast_cache: LruDict[str, list[ArgDescription]] = field(default_factory=LruDict, init=False, repr=False, hash=False, compare=False)
+    _warned_kinds: set[WarnKind] = field(default_factory=set, init=False, repr=False, hash=False, compare=False)
+
+    def warn_frame_info(self, frame_depth: int, warn_kind: WarnKind) -> None:
+        """
+        Emit a warning (without duplication) at the caller site.
+
+        :param frame_depth: The frame depth of the call to the parent function.
+        :param warn_kind:   The warning to emit. Only emitted if it's new.
+        """
+        if warn_kind in self._warned_kinds:
+            return
+        else:
+            self._warned_kinds.add(warn_kind)
+
+        warnings.warn(
+            message=warn_kind.value,
+            category=RuntimeWarning,
+            stacklevel=frame_depth + 1,
+        )
+
+    def simple_print(self, *args: *tuple[object, *tuple[object, ...]], **kwargs: Unpack[_DbgKwargs]) -> None:
+        """
+        Fallback print method.
+
+        Comparable to default print.
+        """
+        with_id = kwargs.get("with_id", self.with_id)
+        with_type = kwargs.get("with_type", self.with_type)
+
+        for arg in args:
+            if with_id:
+                print(id(arg))
+            if with_type:
+                print(type(arg))
+            print(arg, end="\n\n")
+
+    def format_out(self, args: list[ArgDescription], arg_vals: tuple[object, *tuple[object, ...]], **kwargs: Unpack[_DbgKwargs]) -> None:
+        """
+        Format output paired with source argument description.
+        """
+        with_id = kwargs.get("with_id", self.with_id)
+        with_type = kwargs.get("with_type", self.with_type)
+
+        # TODO: what to do with consts?
+        for (_is_const, arg_name), arg_value in zip(args, arg_vals, strict=False):
+            arg_description = (
+                arg_name,
+                str(type(arg_value)) if with_type else None,
+                f"id[{id(arg_value)}]" if with_id else None,
+            )
+            arg_description = f"{", ".join(filter(None, arg_description))}:"
+
+            if in_notebook and display is not None and Html is not None:
+                display(Html(f"<h5>{arg_description}</h5>"))
+                display(arg_value)
+            else:
+                print(arg_description, arg_value, sep=" ", end="\n")
+        print()
+
     @staticmethod
-    @cache
-    def argsplit_re() -> regex.Pattern[str]:
-        arg_cap = r""" *(\w+) *"""
-        qote_cap = r""" *((?P<qseq>(?P<qch>["'])(?:(?P=qch){2})?).*?(?<!\\)(?P=qseq)) *"""
-        call_cap = r""" *\w+\((?: *(?&expr)( *,? *(?&expr))*)\) *"""
-        num_cap = r""" *(\d*(?:\.\d*)?) *"""
-        seq_cap = r""" *(?:(?P<sd>\{)|(?P<lst>\[)|(?P<tp>\()) *(?P<kv>(?&expr) *(?:: *(?&expr))? *(?:, *(?&kv) *)*,? *)(?(lst)\])(?(tp)\))(?(sd)\}) *"""
-        fn_break = fr"""^ *\w+\((?:(?P<arg>(?P<expr>{arg_cap}|{qote_cap}|{call_cap}|{num_cap}|{seq_cap}) *(?:[-+*/] *(?&expr))*)(?:, *(?&arg))*) *(?:, *\w* *= *True *)*\) *(?:\#.*)?$"""
-        return regex.compile(fn_break)
+    def context(call_frame: FrameType) -> tuple[Path, int, str]:
+        """
+        Retrieve call frame context.
+        """
+        frame_info = inspect.getframeinfo(call_frame)
+        line_number = frame_info.lineno
+
+        parent_function = frame_info.function
+
+        filepath = Path(frame_info.filename)
+        return filepath, line_number, parent_function
 
     @classmethod
     @cache
     def default(cls) -> Self:
+        """
+        Retrieve the default quasi-singleton instance.
+        """
         return cls()
 
-    @property
-    def installed(self) -> bool:
-        return getattr(builtins, "dbg", None) is self
+    @classmethod
+    def installed(cls) -> bool:
+        """
+        Whether the `dbg` function is installed in builtins.
+        """
+        return getattr(builtins, "dbg", None) is dbg
 
-    def install(self) -> None:
+    @classmethod
+    def install(cls) -> None:
+        """
+        Install the `dbg` function into builtins.
+
+        This makes it globally available without import.
+        """
         current = getattr(builtins, "dbg", None)
 
         if current is None:
-            return setattr(builtins, "dbg", self)
+            return setattr(builtins, "dbg", dbg)
 
-        if current is not self:
+        if current is not dbg:
             raise ValueError("different dbg instance already installed.")
 
-    def uninstall(self) -> None:
+    @classmethod
+    def uninstall(cls) -> None:
+        """
+        Remove the `dbg` function from builtins.
+        """
         current = getattr(builtins, "dbg", None)
-        if current is self:
+        if current is dbg:
             return delattr(builtins, "dbg")
         if current is not None:
             raise ValueError("different dbg installed but asked to uninstall.")
@@ -83,12 +202,6 @@ class _DebugImpl(AbstractContextManager[DebugImplT]):
         Inspects the stack to retrieve the expression the function was called with.
         Also tries to format in a notebook environment.
 
-        Note: passing variables that uniquely identify values
-        will be faster than passing aliased or literal values
-        as getting variable expressions for the latter requires
-        parsing the calling code, the former variable names can
-        be inferred from callers `local` and `global` variables.
-
         :param args: The values to be printed.
         :param frame_depth: If calling via proxy, set the stack
             depth to inspect for variable names.
@@ -98,110 +211,119 @@ class _DebugImpl(AbstractContextManager[DebugImplT]):
 
         current_frame = inspect.currentframe()
         if current_frame is None:
-            raise RuntimeError("Unable to inspect current stack frame")
+            self.warn_frame_info(frame_depth=frame_depth, warn_kind=WarnKind.no_frame)
+            return self.simple_print(*args, **kwargs)
 
-        def print_defs(arg_names: list[tuple[str, object]]) -> None:
-            with_id = kwargs.get("with_id", self.with_id)
-            with_type = kwargs.get("with_type", self.with_type)
+        parent_frame_info = inspect.getouterframes(current_frame)[frame_depth]
+        call_frame = parent_frame_info.frame
 
-            for raw_arg_name, arg in arg_names:
-                arg_name = raw_arg_name.strip(" ,")
-                if with_id and with_type:
-                    arg_description = f"{arg_name}, {type(arg)} id[{id(arg)}]:"
-                elif with_id:
-                    arg_description = f"{arg_name}, id[{id(arg)}]:"
-                elif with_type:
-                    arg_description = f"{arg_name}, {type(arg)}:"
-                else:
-                    arg_description = f"{arg_name}:"
-                if in_notebook and display is not None and Html is not None:
-                    display(Html(f"<h5>{arg_description}</h5>"))
-                    display(arg)
-                else:
-                    print(arg_description, arg, sep="\n", end="\n\n")
+        frame_tb = inspect.getframeinfo(call_frame)
+        fn_first_line = call_frame.f_code.co_firstlineno
 
-        parent_frame = inspect.getouterframes(current_frame)[frame_depth]
+        pos = frame_tb.positions
+        if pos is None:
+            self.warn_frame_info(frame_depth=frame_depth, warn_kind=WarnKind.no_src)
+            return self.simple_print(*args, **kwargs)
 
-        arg_names: list[tuple[str, object]] = []
-        for arg in args:
-            found_count = 0
-            for name, var in parent_frame[0].f_locals.items():
-                if arg is var:
-                    arg_names.append((name, var))
-                    found_count += 1
-            for name, var in parent_frame[0].f_globals.items():
-                if arg is var:
-                    arg_names.append((name, var))
-                    found_count += 1
-
-            if found_count != 1:
-                break
-        else:
-            return print_defs(arg_names)
-
-        first_line = parent_frame.lineno - 1
-        line_offset = parent_frame[0].f_code.co_firstlineno - 1
-        current_byte_op = parent_frame[0].f_lasti
-        last_line = 0
-        for first_byte, _last_bytes, line_no in parent_frame[0].f_code.co_lines():
-            if line_no is None:
-                continue
-            if (first_byte > current_byte_op) and (line_no > first_line):
-                last_line = max((last_line, line_no - 1))
-                break
-            last_line = max((last_line, line_no))
-        else:
-            last_line = None
-        if (last_line is not None) and (first_line > last_line):
-            warnings.warn("unable to extract frame info, dbg doesn't work well in optimized modes, windows isn't yet well supported.", stacklevel=frame_depth)
-            print(*args)
-            return None
-
-        first_line -= line_offset
+        # line numbers are seemingly relative to
+        # first line of function (but not documented
+        # as such)
+        first_line = pos.lineno
+        if first_line is not None:
+            first_line -= fn_first_line
+        last_line = pos.end_lineno
         if last_line is not None:
-            last_line -= line_offset
+            # closed range to half open range
+            last_line += 1
+            last_line -= fn_first_line
 
-        call_code = inspect.getsource(parent_frame[0]).splitlines()[first_line:last_line]
-        call_code = "".join(call_code)
+        call_code = inspect.getsource(call_frame).splitlines()[first_line: last_line]
 
-        split_pat = self.argsplit_re()
-        arg_match = split_pat.match(call_code)
-        if arg_match is None and ";" in call_code:
-            call_code = [
-                chunk
-                for chunk in call_code.split(";")
-                if len(chunk.strip()) > 0
-            ]
-            call_code = call_code[-1]
-            arg_match = split_pat.match(call_code)
+        start_col = pos.col_offset
+        end_col = pos.end_col_offset
+        # Note: slice last line first incase it's only 1 line
+        call_code[-1] = call_code[-1][:end_col]
+        call_code[0] = call_code[0][start_col:]
 
-        if arg_match is None:
-            warnings.warn("unable to extract call arg names. raise an issue and use simpler call syntax.", stacklevel=frame_depth)
-            print(*args)
-            return None
+        # cleandoc - by slicing the first line we're dedenting
+        # that and that only, also dedent other lines for prettier
+        # formatted code - not currently used
+        call_src = cleandoc("\n".join(call_code))
 
-        cap_names = arg_match.captures("arg")
-        cap_names = [cap for cap in cap_names if len(cap) > 0]
-        if len(cap_names) != len(args):
-            warnings.warn("extracted incorrect number of arg names. raise an issue and use simpler call syntax.", stacklevel=frame_depth)
-            print(*args)
-            return None
-        return print_defs(list(zip(cap_names, args, strict=True)))
+        arg_names = self._ast_cache.get(call_src)
+        if arg_names is None:
+            try:
+                arg_names = self.parse_args(call_src)
+            except ValueError:
+                self.warn_frame_info(frame_depth, WarnKind.parse_error)
+                return self.simple_print(*args, **kwargs)
 
-    __stack: list[ExitStack] = field(default_factory=list, init=False)
+            self._ast_cache[call_src] = arg_names
+        return self.format_out(arg_names, args, **kwargs)
+
+    @staticmethod
+    def parse_args(call_src: str) -> list[ArgDescription]:
+        """
+        Parse argument expressions from the source for a call to `dbg`.
+        """
+        call_lines = call_src.splitlines()
+        call_mod_ast = ast.parse(call_src)
+        call_ast = call_mod_ast.body[0]
+
+        if not isinstance(call_ast, ast.Expr):
+            raise ValueError
+        call_ast = call_ast.value
+        if not isinstance(call_ast, ast.Call):
+            raise ValueError
+
+        defs: list[ArgDescription] = []
+
+        for arg in call_ast.args:
+
+            lineno = arg.lineno
+            end_lineno = arg.end_lineno
+            col_offset = arg.col_offset
+            end_col_offset = arg.end_col_offset
+
+            if lineno:
+                # linno/end_lineno 1 indexed, closed to half open
+                lineno -= 1
+
+            arg_lines = call_lines[lineno: end_lineno]
+            arg_lines[-1] = arg_lines[-1][:end_col_offset]
+            arg_lines[0] = arg_lines[0][col_offset:]
+            arg_src = "\n".join(arg_lines)
+
+            arg_desc = ArgDescription(arg_src=arg_src, is_const=isinstance(arg, ast.Constant))
+            defs.append(arg_desc)
+
+        return defs
+
+    __stack: list[_DbgKwargs] = field(default_factory=list, init=False)
 
     @override
     def __enter__(self) -> Self:
-        state = ExitStack()
-        state.enter_context(patch.dict(self.__dict__))
+        state = _DbgKwargs(
+            enabled=self.enabled,
+            with_type=self.with_type,
+            with_id=self.with_id,
+        )
+        assert set(state) == _DbgKwargs.__optional_keys__ | _DbgKwargs.__required_keys__
         self.__stack.append(state)
         return self
 
     @override
     def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None, /) -> None:
-        self.__stack.pop().close()
+        state = self.__stack.pop()
+        for key, val in state.items():
+            setattr(self, key, val)
 
     def __call__[**P, R](self, fn: Callable[P, R], **call_kwargs: Unpack[_EnableKwarg]) -> Callable[P, R]:
+        """
+        Directly call the instance as a decorator to a function.
+
+        Can also be used via proxy to calls to `dbg`.
+        """
         @wraps(fn)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             if not call_kwargs.get("enabled", self.enabled):
@@ -235,12 +357,19 @@ class _CfgKwargs(_DbgKwargs):
 
 @final
 @dataclass
-class _Debug[CfgT: (_DbgKwargs, _EnableKwarg, None)](AbstractContextManager[None]):
-    impl: _DebugImpl
+class DebugProxy[CfgT: (_DbgKwargs, _EnableKwarg, None)](AbstractContextManager[None]):
+    """
+    Proxy calls to `Debug`.
+
+    Mainly used for ambiguous call cases, eg
+    decorator vs context manager.
+    """
+
+    impl: Debug
     kwargs: CfgT
 
     @override
-    def __enter__(self: _Debug[_DbgKwargs] | _Debug[_EnableKwarg]) -> None:
+    def __enter__(self: DebugProxy[_DbgKwargs] | DebugProxy[_EnableKwarg]) -> None:
         impl = self.impl
         kwargs = self.kwargs
         impl.__enter__()
@@ -252,18 +381,21 @@ class _Debug[CfgT: (_DbgKwargs, _EnableKwarg, None)](AbstractContextManager[None
         if "enabled" in kwargs:
             impl.enabled = kwargs["enabled"]
 
-    def __call__[**P, R](self: _Debug[None] | _Debug[_EnableKwarg], fn: Callable[P, R], /) -> Callable[P, R]:
+    def __call__[**P, R](self: DebugProxy[None] | DebugProxy[_EnableKwarg], fn: Callable[P, R], /) -> Callable[P, R]:
+        """
+        Proxy object call method.
+        """
         if self.kwargs is None:
             return self.impl(fn)
         return self.impl(fn, **self.kwargs)
 
     @override
-    def __exit__(self: _Debug[_DbgKwargs], exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None, /) -> None:
+    def __exit__(self: DebugProxy[_DbgKwargs] | DebugProxy[_EnableKwarg], exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None, /) -> None:
         return self.impl.__exit__(exc_type, exc_value, traceback)
 
 
 @overload
-def dbg() -> _Debug[None]:
+def dbg() -> DebugProxy[None]:
     ...
 
 
@@ -271,7 +403,7 @@ def dbg() -> _Debug[None]:
 def dbg(
     *,
     enabled: bool,
-) -> _Debug[_EnableKwarg]:
+) -> DebugProxy[_EnableKwarg]:
     ...
 
 
@@ -281,7 +413,7 @@ def dbg(
     with_type: bool,
     with_id: bool = ...,
     enabled: bool = ...,
-) -> _Debug[_DbgKwargs]:
+) -> DebugProxy[_DbgKwargs]:
     ...
 
 
@@ -291,7 +423,7 @@ def dbg(
     with_type: bool = ...,
     with_id: bool,
     enabled: bool = ...,
-) -> _Debug[_DbgKwargs]:
+) -> DebugProxy[_DbgKwargs]:
     ...
 
 
@@ -338,7 +470,7 @@ def dbg(
     ...
 
 
-def dbg[**P, R](*args: *tuple[object, ...], **kwargs: Unpack[_CfgKwargs]) -> _Debug[_EnableKwarg] | _Debug[_DbgKwargs] | _Debug[None] | None:
+def dbg[**P, R](*args: *tuple[object, ...], **kwargs: Unpack[_CfgKwargs]) -> DebugProxy[_EnableKwarg] | DebugProxy[_DbgKwargs] | DebugProxy[None] | None:
     """
     Single function to configurably render arbitrary variable names and values.
 
@@ -346,7 +478,7 @@ def dbg[**P, R](*args: *tuple[object, ...], **kwargs: Unpack[_CfgKwargs]) -> _De
 
     * Call without arguments to use as a function decorator, or with `enabled` to explicitly enable/disable the decorator.
     * Call with option keywords and `store=True` to configure how a value is rendered.
-    * Call with option keywords without `store` to temoprarily configure within a context.
+    * Call as a context manager with option keywords without `store` to temoprarily configure within a context.
     * Call with positional arguments to print the names and values called with.
 
     Inspects the stack to retrieve the expression the function was called with.
@@ -368,18 +500,14 @@ def dbg[**P, R](*args: *tuple[object, ...], **kwargs: Unpack[_CfgKwargs]) -> _De
     ...     a,
     ...     "foo",
     ... )
-    a:
-    ['hello', 'world']
-    <BLANKLINE>
-    "foo":
-    foo
+    a: ['hello', 'world']
+    "foo": foo
     <BLANKLINE>
 
     This includes expressions:
     >>> from what2.debug import dbg
     >>> dbg(3+4)
-    3+4:
-    7
+    3+4: 7
     <BLANKLINE>
 
     When called without arguments, it returns
@@ -423,16 +551,13 @@ def dbg[**P, R](*args: *tuple[object, ...], **kwargs: Unpack[_CfgKwargs]) -> _De
     >>> with dbg(with_type=True):
     ...     dbg(5)
     ...     dbg(a)
-    5, <class 'int'>:
-    5
+    5, <class 'int'>: 5
     <BLANKLINE>
-    a, <class 'list'>:
-    ['hello', 'world']
+    a, <class 'list'>: ['hello', 'world']
     <BLANKLINE>
     >>> with dbg(with_id=True): # doctest: +ELLIPSIS
     ...     dbg(a)
-    a, id[...]:
-    ['hello', 'world']
+    a, id[...]: ['hello', 'world']
     <BLANKLINE>
 
     It can be called with a mix of expressions and arguments:
@@ -442,24 +567,22 @@ def dbg[**P, R](*args: *tuple[object, ...], **kwargs: Unpack[_CfgKwargs]) -> _De
     ...     a,
     ...     "foo",
     ... )
-    a:
-    ['hello', 'world']
-    <BLANKLINE>
-    "foo":
-    foo
+    a: ['hello', 'world']
+    "foo": foo
     <BLANKLINE>
 
     Doctest Examples
     ----------------
     >>> from what2.debug import dbg
     >>> dbg(3+4)
-    3+4:
-    7
+    3+4: 7
     <BLANKLINE>
     >>> a = ["hello", "world"]
     >>> dbg(a)
-    a:
-    ['hello', 'world']
+    a: ['hello', 'world']
+    <BLANKLINE>
+    >>> dbg([chunk for chunk in a])
+    [chunk for chunk in a]: ['hello', 'world']
     <BLANKLINE>
     >>> @dbg()
     ... def foo(arg: int) -> str:
@@ -481,42 +604,33 @@ def dbg[**P, R](*args: *tuple[object, ...], **kwargs: Unpack[_CfgKwargs]) -> _De
     >>> with dbg(with_type=True):
     ...     dbg(5)
     ...     dbg(a)
-    5, <class 'int'>:
-    5
+    5, <class 'int'>: 5
     <BLANKLINE>
-    a, <class 'list'>:
-    ['hello', 'world']
+    a, <class 'list'>: ['hello', 'world']
     <BLANKLINE>
     >>> with dbg(with_id=True): # doctest: +ELLIPSIS
     ...     dbg(a)
-    a, id[...]:
-    ['hello', 'world']
+    a, id[...]: ['hello', 'world']
     <BLANKLINE>
     >>> dbg(a, "foo")
-    a:
-    ['hello', 'world']
-    <BLANKLINE>
-    "foo":
-    foo
+    a: ['hello', 'world']
+    "foo": foo
     <BLANKLINE>
     >>> dbg(
     ...     a,
     ...     "foo",
     ... )
-    a:
-    ['hello', 'world']
-    <BLANKLINE>
-    "foo":
-    foo
+    a: ['hello', 'world']
+    "foo": foo
     <BLANKLINE>
     """
-    default_dbg = _DebugImpl.default()
+    default_dbg = Debug.default()
     match len(args), len(kwargs):
         case 0, 0:
-            return _Debug(default_dbg, None)
+            return DebugProxy(default_dbg, None)
         case 0, _:
             if "store" not in kwargs:
-                return _Debug(default_dbg, kwargs)
+                return DebugProxy(default_dbg, kwargs)
             if "with_type" in kwargs:
                 default_dbg.with_type = kwargs["with_type"]
             if "with_id" in kwargs:

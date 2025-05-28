@@ -1,11 +1,12 @@
 [project]
 name = "what2"
-version = "0.4.3"
+version = "0.4.0"
 description = "A collection of my random dev tools and scripts."
 authors = [
     {name = "Marc Edwards", email = "marc@mlwhat.com"}
 ]
-dependencies = ["regex>=2024.11.6"]
+dependencies = [
+]
 requires-python = ">=3.13"
 readme = "README.md"
 license = {text = "MIT"}
@@ -109,6 +110,7 @@ ignore = [
     "E261", # At least 2 spaces before an inline comment - why?
     "TRY002",
     "TRY003",
+    "TRY004", # Use TypeError for incorrect type - Value error is better, argument parses to wrong type so argument has incorrect value, not incorrect type.
     "FIX001",
     "FIX003",
     "FIX004",

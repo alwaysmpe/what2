@@ -1,13 +1,13 @@
 [project]
 name = "what2"
-version = "0.4.0"
+version = "0.4.2"
 description = "A collection of my random dev tools and scripts."
 authors = [
     {name = "Marc Edwards", email = "marc@mlwhat.com"}
 ]
 dependencies = [
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 readme = "README.md"
 license = {text = "MIT"}
 classifiers = [
@@ -31,7 +31,7 @@ addopts = """\
 
 [tool.pyright]
 
-pythonVersion = "3.13"
+pythonVersion = "3.12"
 useLibraryCodeForTypes = true
 reportMissingTypeStubs = false
 reportImplicitOverride = true

@@ -2,6 +2,14 @@
 
 A collection of my random dev tools and scripts.
 
+## PyTest plugin
+
+Adds the following marks:
+* `@pytest.mark.nix` - Unix-only tests, equivalent to `@pytest.mark.skipif(condition='sys.platform != "win32"', reason="nix-only test")`
+* `@pytest.mark.win` - Windows-only tests, equivalent to `@pytest.mark.skipif(condition='sys.platform == "win32"', reason="win-only test")`
+* `@pytest.mark.todo` - skips the test, showing its short status as `t` and long status as `TODO`.
+* `@pytest.mark.must_fail(raises=T)` - similar to `@pytest.mark.xfail(strict=True, raises=T)`, however the test is marked as `passed` if it raises the correct exception and `failed` otherwise (for those that don't like the pesky `x` that will never be removed).
+
 ## `dbg` function
 
 ```python
